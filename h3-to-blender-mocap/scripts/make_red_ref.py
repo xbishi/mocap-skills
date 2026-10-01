@@ -56,6 +56,7 @@ def main():
     corner = int(sys.argv[3]) if len(sys.argv) > 3 else 20
     thr = float(sys.argv[4]) if len(sys.argv) > 4 else 40.0
     dim = float(sys.argv[5]) if len(sys.argv) > 5 else 0.25
+    gain = float(sys.argv[6]) if len(sys.argv) > 6 else 1.0
 
     w, h = probe_wh(src)
     tmpdir = Path(tempfile.mkdtemp(prefix="redref_"))
@@ -83,7 +84,7 @@ def main():
             fg_ratios.append(float(mask.mean()))
             luma = img.mean(axis=2)
             # 掩码内全额、掩码外 x dim —— 只进红通道
-            r = luma * (mask + dim * (~mask))
+            r = np.clip(luma * (mask + dim * (~mask)) * gain, 0, 255)
             out = np.zeros((h, w, 3), dtype=np.uint8)
             out[..., 0] = np.clip(r, 0, 255)
             # 写回 png（用 ffmpeg rawvideo->png，零依赖）

@@ -1,22 +1,71 @@
 # -*- coding: utf-8 -*-
-"""全帧实测+逐帧贪心分配 -> targets.json -> 生成K脚本
-映射: 场景帧N = 视频帧N+8 (用户设定, 勿改)
-方法: 每帧按身体中心线分前/后腿; 同组内升序x贪心分配给"上帧值最近"的骨
+"""H3视频→Blender 逐帧对位动捕: 全帧实测 + 逐帧贪心分配 -> targets.json -> 生成K脚本
+
+方法与坑见 SKILL.md / references/pitfalls.md。
+=======================================================================
+CONFIG —— 换项目/换rig 必须逐项确认（每一项都踩过坑, 别跳）：
+  1. BASE/REF_DIR/OUT_DIR  路径
+  2. W,H,PX  渲染分辨率; PX = ortho_scale / W  (1px 对应世界单位)
+  3. REST  前爪/后脚在参考帧1的屏幕x (静止姿势的位置, 看帧1底部轮廓峰)
+  4. OFFSET  帧映射: 场景帧N = 视频帧N+OFFSET (按用户/项目约定, 别自己改)
+  5. GROUND  地面线y (参考帧底部轮廓的98分位)
+  6. REAR_X/FRONT_X  背线测量区间(避开尾巴与头, 取背部纯线段)
+  7. 骨骼名  4脚IK / torso / hips / chest / 尾巴链 / head —— 用 dump_bones.py 查, 
+     用 calibrate_bones.py 标定 local→世界方向(必须 1:1 或记录下来换算)
+  8. PAIRED_PLANT  远侧腿重合站立分离帧(视频条带目检定) —— 见 pitfalls.md #4
+  9. 尾巴参数  见 pitfalls.md #6 (spine_master.003 quatX + 约束置0鞭状波)
+ 10. 头部区域 x 区间(头顶/颈基)
+=======================================================================
 """
 import subprocess, numpy as np, json, sys
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+# ---------------- CONFIG ----------------
 BASE = Path(r"H:\claude_workspace\3d_hub\projects\动作捕捉")
+REF_DIR = BASE / "scripts/_gait_run20"    # 00021 奔跑·20步清晰版抽帧
+OUT_DIR = BASE / "verify_00021"           # 00021 独立输出(不覆盖走路工程)
 W, H = 608, 352
-PX = 0.0049
-REST = {"front": 393.0, "rear": 211.0}
-OFFSET = 7
-GROUND = 292.0
-LIFT = 0.13
+PX = 0.0049                               # 1px = 0.0049 世界单位 (ortho 2.977 / 608)
+REST = {"front": 393.0, "rear": 211.0}    # 前爪/后脚静止位(屏幕x)
+OFFSET = 14                               # 场景1=视频14(站立归位hold), 视频20(场景6)起跑                                # 场景帧N = 视频帧N+OFFSET
+GROUND = 292.0                            # 地面线
+BG_THR = 32                               # v2: 模糊容忍前景阈值(默认40, 奔跑模糊吃脚)
+REAR_X = (160, 260)                       # 臀区背线 x 区间
+FRONT_X = (330, 430)                      # 肩区背线 x 区间
+LIFT = 0.32                               # v3: 奔跑抬脚更高(腾空收拢)
+ROCK_SCALE = 0.6                          # v2: 摇摆实测缩放
+SEG_MERGE_GAP = 25                        # 峰合并阈值(px)
+PEAK_DEPTH = 8                            # 离地判定的深度(px)
+PEAK_TRACK_TOL = 60                       # 轨迹追踪连续性容差(px)
+TAIL_MASTER = "spine_master.003"          # 尾巴专控(quatX)
+TAIL_SEGS = [("spine.002", 0.04, 1), ("spine.001", 0.05, 2), ("spine", -0.07, 3)]  # 奔跑节拍快,延迟/幅度缩小
+TAIL_MASTER_AMP = 0.06                    # 慢速整体摆幅度
+TAIL_MASTER_PERIOD = 28                   # 尾摆慢分量(4倍步态)                   # 慢速整体摆周期(帧)
+GAIT_PERIOD = 14                          # 奔跑步态周期(20步版自相关实测)                          # 步态周期(帧, measure_freq.py 实测)
+def swing_curve(t, x0, x1, lift):
+    """奔跑摆动形态: x 前快后稳, z 抬高-停留-落地(非对称, 区别于走路正弦弧)"""
+    te = t * t * (3 - 2 * t)
+    xfrac = te * 0.75 + t * 0.25          # 前段更快到达
+    x = x0 + (x1 - x0) * xfrac
+    z = lift * (np.sin(np.pi * min(t, 1.0)) ** 0.7)   # 宽峰停留
+    return x, z
+
+LEG_VERT = {"front": 0.75, "rear": 0.87}    # 髋到脚的静息垂直高(标定)
+MAX_REACH = {"front": 0.75, "rear": 0.88}   # 可达半径(≈腿全长, 超出必拉细/翻折)
+PAIRED_PLANT = {                          # 远侧腿重合站立: (伙伴骨, 分离帧)
+    "front_foot_ik.R": ("front_foot_ik.L", 24),    # 蓄力期双腿贴地,视频24(场景5)腾空
+    "foot_ik.R":       ("foot_ik.L", 24),
+}
+FRONT_BONES = ["front_foot_ik.L", "front_foot_ik.R"]
+REAR_BONES = ["foot_ik.L", "foot_ik.R"]
+HEAD_NOD_SCALE = 0.21                     # head rotX+1.0 -> 头顶Δz = -0.21 (calibrate_bones 标定)
+HEAD_NOD_CLIP = 0.12                      # 点头限幅(rad)
+# ---------------- /CONFIG ----------------
 
 def load_mask(vf):
-    p = BASE / f"scripts/_gait_tmp/g_{vf:03d}.png"
+    p = REF_DIR / f"g_{vf:03d}.png"
     raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(p),
                           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                          capture_output=True, check=True).stdout
@@ -25,7 +74,7 @@ def load_mask(vf):
     pat = np.concatenate([img[:c, :c].reshape(-1, 3), img[:c, -c:].reshape(-1, 3),
                           img[-c:, :c].reshape(-1, 3), img[-c:, -c:].reshape(-1, 3)])
     bg = np.median(pat, axis=0)
-    return np.linalg.norm(img - bg, axis=2) > 40
+    return np.linalg.norm(img - bg, axis=2) > BG_THR
 
 def medfilt(x, k):
     pad = k // 2
@@ -60,9 +109,7 @@ def peaks(mask):
     return merged
 
 # ---------- 1. 逐视频帧: 峰 + 身体中心 + 背线高度(前/后) ----------
-VF = list(range(1 + OFFSET, 65 + OFFSET))    # 视频 9..72
-REAR_X = (160, 260)   # 臀区背线
-FRONT_X = (330, 430)  # 肩区背线
+VF = list(range(OFFSET, OFFSET + 64))    # 视频 9..72
 
 def top_y(m, x0, x1):
     t = []
@@ -86,11 +133,13 @@ for vf in VF:
     ys, xs = np.nonzero(m)
     data[vf] = {"peaks": peaks(m), "cx": float(xs.mean()), "cy": float(ys.mean()),
                 "rear_top": top_y(m, *REAR_X), "front_top": top_y(m, *FRONT_X),
-                "head_top": top_y(m, 465, 545), "neck_top": top_y(m, 415, 460)}
+                "head_top": top_y(m, 465, 545), "neck_top": top_y(m, 415, 460),
+                "back_cx": float(np.nonzero(m[60:150, :])[1].mean())}
 rear_ref = data[VF[0]]["rear_top"]
 front_ref = data[VF[0]]["front_top"]
 head_ref = data[VF[0]]["head_top"]
 neck_ref = data[VF[0]]["neck_top"]
+back_cx0 = data[VF[0]]["back_cx"]
 rt = smooth3([data[vf]["rear_top"] for vf in VF])
 ft = smooth3([data[vf]["front_top"] for vf in VF])
 ht = smooth3([data[vf]["head_top"] for vf in VF])
@@ -108,19 +157,6 @@ print(f"后躯起伏范围: {min(dr)*-1:+.3f}..{max(dr)*-1:+.3f} (世界Z, 相�
 print(f"前躯起伏范围: {min(df)*-1:+.3f}..{max(df)*-1:+.3f}")
 print(f"前后反相性: 相关系数 {np.corrcoef(dr, df)[0, 1]:.2f} (负值=反相波浪,越负越好)")
 
-# 奔跑/走路俯仰: 屏幕背线斜率(度). 正=前低后高(俯), 负=前高后低(仰)
-import math
-PITCH_PIVOT_BASE = 2.99      # rig 静息背线俯仰(标定探针基准)
-PITCH_RAD_PER_DEG = 1.0 / 57.3   # torso quatX: -57.3°/rad(标定), 负号与屏幕角相消
-pitch_list = []
-for vf in VF:
-    th = math.degrees(math.atan2(data[vf]["front_top_s"] - data[vf]["rear_top_s"], 170.0))
-    rot = (th + PITCH_PIVOT_BASE) * PITCH_RAD_PER_DEG
-    pitch_list.append(round(max(-0.30, min(0.30, rot)), 4))
-pl = np.array(pitch_list)
-print(f"躯干俯仰: 范围 {pl.min():+.3f}..{pl.max():+.3f} rad (±{abs(pl).max():.3f})")
-(BASE / "verify" / "pitch.json").write_text(json.dumps(pitch_list), encoding="utf-8")
-
 # 头部实测点头: 头顶Δ - 颈基Δ (去掉身体起伏, 留下头部自身俯仰)
 head_nod = []
 for vf in VF:
@@ -129,8 +165,18 @@ for vf in VF:
     head_nod.append(round(max(-0.12, min(0.12, rot)), 4))
 hn = np.array(head_nod)
 print(f"头部点头: 范围 {hn.min():+.3f}..{hn.max():+.3f} rad (±{abs(hn).max():.3f})")
-(BASE / "verify/head_nod.json").write_text(json.dumps(head_nod), encoding="utf-8")
-print("head_nod.json 已导出(循环生成用)")
+# 奔跑俯仰: 屏幕背线斜率(度). 正=前低后高(俯), 负=前高后低(仰)
+import math
+PITCH_PIVOT_BASE = 2.99      # rig 静息背线俯仰(标定探针基准)
+PITCH_RAD_PER_DEG = 1.0 / 57.3 * 0.55   # v2: 渲染背线响应比探针线过冲1.8倍, 实测缩放
+pitch_list = []
+for vf in VF:
+    th = math.degrees(math.atan2(data[vf]["front_top_s"] - data[vf]["rear_top_s"], 170.0))
+    rot = (th + PITCH_PIVOT_BASE) * PITCH_RAD_PER_DEG
+    pitch_list.append(round(max(-0.35, min(0.35, rot)), 4))
+pl = np.array(pitch_list)
+print(f"躯干俯仰: 范围 {pl.min():+.3f}..{pl.max():+.3f} rad (±{abs(pl).max():.3f})")
+(OUT_DIR / "pitch.json").write_text(json.dumps(pitch_list), encoding="utf-8")
 
 # ---------- 2. 逐帧贪心分配 ----------
 FRONT = ["front_foot_ik.L", "front_foot_ik.R"]
@@ -161,13 +207,6 @@ for vf in VF:
 def bone_frames(b):
     return sorted([vf for (bb, vf) in traj if bb == b])
 
-# 远侧腿"重合站立"修正: 首次落地前踩在伙伴骨(近侧)实测轨迹上, 到分离帧才抬起摆动
-# 分离帧由视频条带逐帧目检: 前峰 38(f9)->25(f11) 且条带见 f9 已微抬 => 前.R 分离@10
-# 后峰条带: f13-16 双爪贴地, f17 远爪明显离地(深色脚底可见) => foot.R 分离@16
-PAIRED_PLANT = {
-    "front_foot_ik.R": ("front_foot_ik.L", 10),
-    "foot_ik.R":       ("foot_ik.L", 16),
-}
 
 def targets_for_bone(b, vf):
     kind = "front" if b.startswith("front") else "rear"
@@ -200,9 +239,8 @@ def targets_for_bone(b, vf):
         if span < 4:                      # 起步就落地: 直接站住
             return round(-(x1 - REST[kind]) * PX, 4), 0.0
         t = min(max((vf - VF[0]) / span, 0.0), 1.0)   # 首次落地前: 从 rest 摆动渐入
-        te = t * t * (3 - 2 * t)
-        x = REST[kind] + (x1 - REST[kind]) * te
-        return round(-(x - REST[kind]) * PX, 4), round(float(LIFT * np.sin(np.pi * t)), 4)
+        x, z = swing_curve(t, REST[kind], x1, LIFT)
+        return round(-(x - REST[kind]) * PX, 4), round(float(z), 4)
     f0 = prev[-1]
     x0 = traj[(b, f0)]
     if not nxt:
@@ -222,16 +260,13 @@ def targets_for_bone(b, vf):
     if f1 <= f0:
         return round(-(x0 - REST[kind]) * PX, 4), 0.0
     t = min(max((vf - f0) / (f1 - f0), 0.0), 1.0)
-    te = t * t * (3 - 2 * t)
-    x = x0 + (x1 - x0) * te
-    return round(-(x - REST[kind]) * PX, 4), round(float(LIFT * np.sin(np.pi * t)), 4)
+    x, z = swing_curve(t, x0, x1, LIFT)
+    return round(-(x - REST[kind]) * PX, 4), round(float(z), 4)
 
 BONES = FRONT + REAR
 targets = {}
-LEG_VERT = {"front": 0.75, "rear": 0.87}    # 髋到脚的静息垂直高(标定)
-MAX_REACH = {"front": 0.75, "rear": 0.88}   # 可达半径(≈腿全长, 超出必拉细/翻折)
-REST_HOLD_END = 0   # walk参考的站立=头前伸姿势(非rig静止), 全程实测
-for N in range(1, 65):
+REST_HOLD_END = 5   # 场景0-5=视频14-19(站立归位hold), 场景6=视频20起跑
+for N in range(0, 64):
     vf = N + OFFSET
     tg = {}
     if N <= REST_HOLD_END:
@@ -254,7 +289,8 @@ for N in range(1, 65):
     dz_r = -(data[vf]["rear_top_s"] - rear_ref) * PX
     dz_f = -(data[vf]["front_top_s"] - front_ref) * PX
     torso_z = (dz_r + dz_f) / 2
-    tg["torso"] = (0.0, 0.0, round(torso_z, 4))
+    rock_y = -ROCK_SCALE * (data[vf]["back_cx"] - back_cx0) * PX   # v2: 背部band质心摇摆(0.6实测缩放)
+    tg["torso"] = (0.0, round(rock_y, 4), round(torso_z, 4))
     tg["hips"] = (0.0, 0.0, round(dz_r - torso_z, 4))
     tg["chest"] = (0.0, 0.0, round(dz_f - torso_z, 4))
     targets[N] = tg
@@ -265,14 +301,15 @@ for b in BONES:
     print(f"  {b}: {len(bone_frames(b))}")
 
 print("\n=== 场景帧目标抽样 (ly/z) ===")
-for N in (1, 5, 13, 20, 30, 40, 50, 64):
+for N in (0, 5, 13, 20, 30, 40, 50, 63):
     t = targets[N]
     print(f"帧{N:2d}(视频{N+OFFSET:2d}): " + "  ".join(
         f"{b}={v[1]:+.3f}/{v[2]:.3f}" for b, v in t.items() if b != "torso")
         + f"  torso={t['torso'][2]:+.4f}")
 
 # ---------- 4. 导出 + 生成 K 脚本 ----------
-(BASE / "verify/targets.json").write_text(
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+(OUT_DIR / "targets.json").write_text(
     json.dumps({str(k): v for k, v in targets.items()}, ensure_ascii=False), encoding="utf-8")
 
 code = '''# -*- coding: utf-8 -*-
@@ -286,15 +323,15 @@ if ad.action:
     ad.action = None
     if old.users == 0:
         bpy.data.actions.remove(old)
-_old = bpy.data.actions.get("walk")
-if _old:
-    if rig.animation_data.action == _old:
+_old_run = bpy.data.actions.get("run")
+if _old_run:
+    if rig.animation_data.action == _old_run:
         rig.animation_data.action = None
-    bpy.data.actions.remove(_old)
-ad.action = bpy.data.actions.new("walk")
+    bpy.data.actions.remove(_old_run)
+ad.action = bpy.data.actions.new("run")
 ad.action.use_fake_user = True
 
-T = json.load(open(r"H:/claude_workspace/3d_hub/projects/动作捕捉/verify/targets.json", encoding="utf-8"))
+T = json.load(open(r"TARGETS_JSON_PLACEHOLDER", encoding="utf-8"))
 for fs, tg in T.items():
     f = int(fs)
     for bone, loc in tg.items():
@@ -304,13 +341,20 @@ for fs, tg in T.items():
             b.keyframe_insert(data_path="location", frame=f)
 
 # ---- 弯腿 pole target 常量(前肘后弯/后膝前弯, 缺了腿变直棍) ----
-for f in (1, 64):
+for f in (0, 63):
     b = rig.pose.bones["front_thigh_ik_target.L"]
-    b.location = (0.0, 0.25, 0.0)
+    b.location = (0.0, 0.45, 0.10)   # 变体B: 奔跑杆位(防止前腿折断)
     b.keyframe_insert(data_path="location", frame=f)
     b = rig.pose.bones["thigh_ik_target.L"]
     b.location = (0.0, -0.25, 0.0)
     b.keyframe_insert(data_path="location", frame=f)
+
+# ---- 躯干俯仰(奔跑 gallop 背线俯仰, 标定 torso quatX -57.3°/rad) ----
+PITCH = json.load(open(r"PITCH_JSON_PLACEHOLDER", encoding="utf-8"))
+for f in range(0, 64):
+    b = rig.pose.bones["torso"]
+    b.rotation_quaternion = Quaternion((1.0, 0.0, 0.0), PITCH[f])
+    b.keyframe_insert(data_path="rotation_quaternion", frame=f)
 
 # ---- 尾巴: 约束置0(关键帧) + 鞭状柔性摆动 ----
 # 分层: master=慢速整体摆(周期50帧), 后三节=步态节拍延迟波(周期25帧, 延迟2/5/8帧, 尖部幅度大)
@@ -322,38 +366,37 @@ for name in ("spine.002", "spine.001", "spine"):
             c.influence = 0.0
             c.keyframe_insert(data_path="influence", frame=1)
             c.keyframe_insert(data_path="influence", frame=64)
-for f in range(1, 65):
+for f in range(0, 64):
     m = rig.pose.bones["spine_master.003"]
-    m.rotation_quaternion = Quaternion((1.0, 0.0, 0.0), 0.06 * math.sin(2 * math.pi * f / 50.0))
+    base_lift = 0.12 + abs(PITCH[f]) * 0.9   # 尾根上抬: 随身体俯仰联动(奔跑时尾巴水平后飘, 不下垂)
+    m.rotation_quaternion = Quaternion((1.0, 0.0, 0.0), base_lift + 0.06 * math.sin(2 * math.pi * f / TAIL_MASTER_PERIOD))
     m.keyframe_insert(data_path="rotation_quaternion", frame=f)
     for name, amp, delay in (("spine.002", 0.05, 2), ("spine.001", 0.07, 5), ("spine", -0.09, 8)):
         b = rig.pose.bones[name]
-        b.rotation_euler = (amp * math.sin(2 * math.pi * (f - delay) / 25.0), 0.0, 0.0)
+        b.rotation_euler = (amp * math.sin(2 * math.pi * (f - delay) / GAIT_PERIOD), 0.0, 0.0)
         b.keyframe_insert(data_path="rotation_euler", frame=f)
-
-# ---- 躯干俯仰(背线俯仰, 标定 torso quatX -57.3°/rad) ----
-PITCH = json.load(open(r"PITCH_JSON_PLACEHOLDER", encoding="utf-8"))
-for f in range(1, 65):
-    b = rig.pose.bones["torso"]
-    b.rotation_quaternion = Quaternion((1.0, 0.0, 0.0), PITCH[f - 1])
-    b.keyframe_insert(data_path="rotation_quaternion", frame=f)
 
 # ---- 头部: 视频实测点头(头顶Δ-颈基Δ, 已标定 rotX 换算) ----
 HEAD_NOD = ''' + json.dumps(head_nod) + '''
-for f in range(1, 65):
+for f in range(0, 64):
     hd = rig.pose.bones["head"]
-    hd.rotation_euler = (HEAD_NOD[f - 1], 0.0, 0.0)
+    hd.rotation_euler = (HEAD_NOD[f], 0.0, 0.0)
     hd.keyframe_insert(data_path="rotation_euler", frame=f)
 
 sc.render.use_compositing = False
 sc.render.image_settings.file_format = "PNG"
-for f in range(1, 65):
+for f in range(0, 64):
     sc.frame_set(f)
-    sc.render.filepath = rf"H:/claude_workspace/3d_hub/projects/动作捕捉/verify/bf_{f:03d}.png"
+    sc.render.filepath = rf"RENDER_DIR_PLACEHOLDER/bf_{f:03d}.png"
     bpy.ops.render.render(write_still=True)
 sc.render.use_compositing = True
 print("K+渲染完成 64帧 (含尾巴鞭状摆动+头部点头)")
 '''
-code = code.replace("PITCH_JSON_PLACEHOLDER", str((BASE / "verify" / "pitch.json")).replace(chr(92), "/"))
-(BASE / "scripts/_batch_k.py").write_text(code, encoding="utf-8")
+code = code.replace("TAIL_MASTER_PERIOD", str(TAIL_MASTER_PERIOD))
+code = code.replace("GAIT_PERIOD", str(GAIT_PERIOD))
+code = code.replace('(("spine.002", 0.05, 2), ("spine.001", 0.07, 5), ("spine", -0.09, 8))', str(tuple(TAIL_SEGS)))
+code = code.replace("PITCH_JSON_PLACEHOLDER", str((OUT_DIR / "pitch.json")).replace(chr(92), "/"))
+code = code.replace("TARGETS_JSON_PLACEHOLDER", str((OUT_DIR / "targets.json")).replace(chr(92), "/"))
+code = code.replace("RENDER_DIR_PLACEHOLDER", str(OUT_DIR).replace(chr(92), "/"))
+(OUT_DIR / "_batch_k.py").write_text(code, encoding="utf-8")
 print("\ntargets.json + _batch_k.py 已生成")
